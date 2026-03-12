@@ -60,11 +60,7 @@ aiter ships a `GemmTuner` in its `gradlib/` directory that benchmarks all availa
 AITER_TUNE_GEMM=1 python3 your_inference_script.py
 # → writes seen shapes to bf16_untuned_gemm.csv in aiter's configs/ directory
 
-# Find where aiter is installed and locate both the config file and tuner script.
-# In the standard docker environment, aiter is at /sgl-workspace/aiter:
-#   Untuned shapes: /sgl-workspace/aiter/aiter/configs/bf16_untuned_gemm.csv
-#   Tuner script:   /sgl-workspace/aiter/gradlib/gradlib/gemm_tuner.py
-# To locate dynamically in other environments:
+# Locate aiter and tuner dynamically:
 AITER_DIR=$(python3 -c "import aiter, os; print(os.path.dirname(aiter.__file__))")
 TUNER=$(find "$AITER_DIR/.." -name "gemm_tuner.py" 2>/dev/null | head -1)
 

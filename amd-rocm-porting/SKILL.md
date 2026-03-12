@@ -137,7 +137,7 @@ If you hit `ImportError`, version mismatch, or dtype errors, read [references/de
 - Only needed if kernel launch overhead is a bottleneck (profile first).
 - Since Inductor CUDAGraphs are disabled on ROCm, use **manual CUDAGraph capture**.
 - **HIP does NOT raise errors for illegal ops during capture** — it silently produces wrong results on replay. Always validate outputs.
-- For capture patterns, RNG patch, and graph break debugging, see the `amd-kernel-optimization` skill's [torch-compile-and-graphs.md](../amd-kernel-optimization/references/torch-compile-and-graphs.md).
+- For capture patterns, RNG patch, and graph break debugging, see [torch-compile-and-graphs.md](../amd-kernel-optimization/references/torch-compile-and-graphs.md).
 
 ### Phase 8: Verification
 - Static: grep for remaining `cuda_runtime.h`, inline PTX, NVIDIA-specific types

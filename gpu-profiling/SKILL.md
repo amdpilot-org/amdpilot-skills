@@ -9,8 +9,11 @@ description: >
 
 # GPU Profiling on AMD ROCm
 
-**Rule: ALWAYS profile before making any optimization changes.**
+**Rule: ALWAYS profile before manual optimization changes.**
 Blind optimization without profiling data is the #1 failure mode.
+If the task clearly points to `torch.compile` as the first major lever, you can
+try compile early, but you still need profiling data before doing manual
+kernel/model surgery.
 
 ## 1. CUDA Graphs Hide Kernel Details
 

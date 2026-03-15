@@ -11,9 +11,9 @@ description: >
 
 ## 3 Rules (read first)
 
-1. **torch.compile FIRST.** `torch.compile(mode="default")` with correct inductor config gives 2-5x speedup. Get this working before any manual optimization. Any code change that breaks compile is a net regression.
+1. **Establish a baseline, then make `torch.compile` the first major optimization.** `torch.compile(mode="default")` with correct inductor config gives 2-5x speedup. Get a reproducible baseline first, then make compile work before any manual kernel surgery. Any code change that breaks compile is a net regression.
 
-2. **Profile before optimizing.** Never guess where time is spent. Run `torch.profiler`, classify GPU time into GEMM / attention / elementwise / launch overhead, then optimize the largest category.
+2. **Profile before manual optimization.** Never guess where time is spent. If CUDA graphs hide kernels, create a fast profiling path with graphs disabled, run `torch.profiler`, classify GPU time into GEMM / attention / elementwise / launch overhead, then optimize the largest category.
 
 3. **Measure after every change.** Benchmark with proper warmup and iterations (see below). Revert if performance regresses.
 
@@ -49,6 +49,7 @@ Each level builds on the previous. **Do NOT skip to Level 3+ without Level 2.**
 - Apply inductor config, compile with `mode="default"`. Details: [references/torch-compile-and-graphs.md](references/torch-compile-and-graphs.md)
 - Fix ALL graph breaks before Level 3: `TORCH_LOGS="graph_breaks" python3 ...`
 - If kernel launch overhead is high after compile, try manual CUDAGraph capture (see reference)
+- Before Level 3, capture a profiling snapshot so you know what compile fixed and what still dominates
 - This alone typically gives 2-5x speedup
 
 ### Level 3: Model surgery (must preserve compile compatibility)

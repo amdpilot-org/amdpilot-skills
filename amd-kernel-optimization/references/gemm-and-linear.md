@@ -79,47 +79,41 @@ export AITER_CONFIG_GEMM_BF16=/tmp/my_tuned_gemm.csv
 
 ## aiter Triton GEMM Kernel Configs
 
-In addition to the CSV-based `tuned_gemm.py` dispatcher, aiter's Triton GEMM kernels (`gemm_a16w16_atomic`, `gemm_a8w8_blockscale`, etc.) use **JSON config files** to select block sizes, warp counts, and K-split parallelization per M-threshold. These configs live in:
+In addition to the CSV-based `tuned_gemm.py` dispatcher, aiter's Triton GEMM kernels (e.g. `gemm_a16w16_atomic`, `gemm_a8w8_blockscale`) use **JSON config files** to select block sizes, warp counts, and other kernel parameters per M-threshold. Look for them in:
 
 ```
-aiter/ops/triton/configs/gemm/gfx950-GEMM-A16W16-ATOMIC.json
-aiter/ops/triton/configs/gemm/gfx950-GEMM-A8W8_BLOCKSCALE.json
-aiter/ops/triton/configs/gemm/gfx950-GEMM-A8W8.json
-aiter/ops/triton/configs/gemm/gfx950-BATCHED_GEMM-A16W16.json
+aiter/ops/triton/configs/gemm/
 ```
+
+File names follow the pattern `{arch}-{KERNEL_TYPE}.json` (e.g. `gfx950-GEMM-A16W16-ATOMIC.json`).
 
 ### Config structure
 
-Each JSON file maps M-threshold keys to tuning parameters:
+Each JSON file maps M-threshold keys to tuning parameter dicts:
 
 ```json
 {
-  "M_LEQ_4": { "BLOCK_SIZE_M": 4, "NUM_KSPLIT": 8, ... },
-  "M_LEQ_16": { "BLOCK_SIZE_M": 16, "NUM_KSPLIT": 2, ... },
-  "any": { "BLOCK_SIZE_M": 256, "NUM_KSPLIT": 1, ... }
+  "M_LEQ_N": { "BLOCK_SIZE_M": ..., "NUM_KSPLIT": ..., ... },
+  "any": { "BLOCK_SIZE_M": ..., "NUM_KSPLIT": ..., ... }
 }
 ```
 
-The kernel dispatches to the first matching entry where M <= threshold. The `"any"` key is the fallback.
+The kernel dispatches to the first entry where the runtime M value is <= the threshold. The `"any"` key is the fallback used when no threshold matches.
 
-### Why this matters for decode
+### Tuning methodology
 
-Default configs ship with large `BLOCK_SIZE_M` (128-256) and `NUM_KSPLIT=1` in the `"any"` entry — tuned for training with large batch sizes. For **batch=1 decode (M=1)**, this wastes >99% of warps.
+Default `"any"` entries are typically tuned for large-batch workloads. When profiling reveals that a GEMM kernel dominates decode latency, check whether the active config's `BLOCK_SIZE_M` is appropriate for the actual runtime M value:
 
-**Fix:** Add `M_LEQ_4/8/16` entries with small `BLOCK_SIZE_M` (4/8/16) and `NUM_KSPLIT > 1` to parallelize the K-dimension reduction. This is a simple JSON edit that can reduce decode latency by 30-50%.
+1. **Profile** to identify the dominant GEMM kernels and their actual (M, N, K) shapes at runtime
+2. **Read** the corresponding JSON config to see what parameters are active for that M
+3. **Add M-threshold entries** if the fallback is suboptimal for the workload's M range
+4. **Benchmark** each config change — parameter interactions are non-obvious; always measure
 
-### Key parameters
-
-| Parameter | Small M (decode) | Large M (training) |
-|-----------|-------------------|-------------------|
-| BLOCK_SIZE_M | 4-16 | 64-256 |
-| NUM_KSPLIT | 2-8 (K-split parallelism) | 1 (no split) |
-| num_warps | 2-4 | 4-8 |
-| waves_per_eu | 4 | 2 |
+Key parameters to tune: `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `NUM_KSPLIT` (K-dimension parallelization), `num_warps`, `waves_per_eu`.
 
 ### Diagnostic
 
-Check which config is being used by looking at the `_get_config` call path in `aiter/ops/triton/gemm/basic/gemm_a16w16_atomic.py`. The function reads from these JSON files via `get_gemm_config()` in `gemm_config_utils.py`.
+Trace config selection via `_get_config` in `aiter/ops/triton/gemm/basic/gemm_a16w16_atomic.py` → `get_gemm_config()` in `gemm_config_utils.py`. Add prints to see which config entry is matched at runtime.
 
 ## Routing nn.Linear Through a Custom GEMM Backend
 

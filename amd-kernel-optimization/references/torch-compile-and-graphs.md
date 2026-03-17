@@ -187,6 +187,40 @@ t_schedule = self._cached_schedule["t"]
 - Large graphs can segfault on HIP — try `@torch.compiler.disable` on largest submodule, or piecewise compilation
 - Memory growth with dynamic shapes: pad inputs to fixed shape before capture
 
+## Selective (Per-Module) torch.compile
+
+When full-model compile fails (e.g., graph breaks in attention or custom allreduce), try compiling individual modules instead.
+
+### Approach
+
+```python
+# After model loading, compile specific modules:
+for name, module in model.named_modules():
+    if should_compile(module):
+        module.forward = torch.compile(module.forward, mode='default', dynamic=True)
+```
+
+Use `@torch.compiler.disable` on submodules that break compilation:
+```python
+for name, submod in decoder_layer.named_modules():
+    if breaks_compile(submod):
+        submod.forward = torch.compiler.disable(submod.forward)
+decoder_layer.forward = torch.compile(decoder_layer.forward, mode='default', dynamic=True)
+```
+
+### Interaction with CUDA graph capture
+
+Compiled modules that internally use Triton JIT kernels (e.g., custom GEMM, fused MoE) may fail during CUDA graph capture because:
+- Triton autotuner makes data-dependent kernel selections during capture
+- Custom communicator handles (e.g., allreduce IPC) may not survive Dynamo tracing
+
+**Test strategy**: start with the simplest modules (LayerNorm, elementwise ops) and work outward. Benchmark each addition. If CUDA graph capture fails, the compiled module is incompatible — exclude it.
+
+### When selective compile helps vs. doesn't
+
+- **Helps**: when many small elementwise ops can be fused (e.g., vanilla PyTorch model without custom kernels)
+- **Does not help**: when critical ops already use hand-optimized kernels (aiter, CK, Triton) that torch.compile cannot improve. In this case, backend config tuning (block sizes, K-split, etc.) is the higher-leverage optimization.
+
 ## Caching
 
 ```bash

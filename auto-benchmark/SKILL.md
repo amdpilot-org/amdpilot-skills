@@ -255,7 +255,7 @@ After a run, summarize:
 |--------|---------------|------------|
 | GPU visibility | `CUDA_VISIBLE_DEVICES` | `HIP_VISIBLE_DEVICES` |
 | Attention backends | `fa3`, `flashinfer` | `aiter`, `triton` |
-| Graph runtime | CUDA graph | HIP graph (same flag names) |
+| Graph runtime | CUDA graph | HIP graph (**flag names unchanged** — `cuda_graph_max_bs`, `disable_cuda_graph` etc. still use "cuda" prefix in vLLM/SGLang CLI even on ROCm) |
 | GPU query | `nvidia-smi` | `rocm-smi --showproductname` |
 | Arch detection | N/A | `rocminfo \| grep gfx` |
 | AllReduce fusion | N/A | `--enable-aiter-allreduce-fusion` |

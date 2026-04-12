@@ -78,6 +78,20 @@ Each level builds on the previous. **Do NOT skip to Level 3+ without Level 2.**
 | hipBLASLt | Fused epilogues; may beat rocBLAS for some shapes |
 | aiter tuned GEMM | Auto-dispatches best kernel per (M,N,K) from tuned configs |
 | FP8 GEMM (MI300+) | `gemm_a8w8` via aiter; gfx942=`e4m3fnuz`, gfx950=`e4m3fn` |
+| Triton FP8 GEMM | `--fp8-gemm-backend triton` — may be faster for decode (small M) on gfx950 |
+
+**Backend switching is a first-class optimization lever**, separate from config tuning
+within a backend. Decision tree:
+1. Profile first → identify top hotspot kernel and its backend
+2. If hotspot is CK GEMM and workload is decode (small M) → try Triton FP8 GEMM
+3. If hotspot is "Other/Triton" → check Triton config JSON for gfx950 entries
+4. Do NOT spend >3 rounds tuning configs within one backend without profiling verification
+
+**WARNING — FP8 dtype differs by GPU architecture:**
+- gfx942 (MI300X): `torch.float8_e4m3fnuz` — hardware only supports FNUZ
+- gfx950 (MI355X): `torch.float8_e4m3fn` — hardware supports both, aiter chooses IEEE
+- Do NOT assume `is_fp8_fnuz()` should return True for all AMD GPUs
+- Check: `aiter/ops/triton/utils/types.py` → `get_fp8_dtypes()`
 
 ### Attention
 | Option | Notes |
@@ -103,6 +117,7 @@ Each level builds on the previous. **Do NOT skip to Level 3+ without Level 2.**
 - **Testing only in isolation**: Optimizations compose. A technique showing 0% alone may enable others. Build incrementally — each new technique applied ON TOP of all previous ones.
 - **Reducing benchmark parameters**: Setting `WARMUP=0 ITERATIONS=1` gives meaningless numbers. Optimize the code, not the test.
 - **aiter tuned GEMM with no tuned configs**: Default config CSV ships empty — `gemm_a16w16` silently falls back to `F.linear` (no error, no benefit). Diagnose: `AITER_LOG_TUNED_CONFIG=1`; if "using torch solution:0", generate configs or use `PYTORCH_TUNABLEOP_ENABLED=1`. Full workflow: [references/gemm-and-linear.md](references/gemm-and-linear.md).
+- **Blind backend tuning without decode profiling**: If >40% of decode GPU time is "Other" / unidentified, do NOT proceed to GEMM config tuning. Fix profiling first (see gpu-profiling skill). The Phase 2C GLM-5.1 experiment spent 6 trials tuning CK GEMM configs while 46% of decode time was unprofiled Triton kernels.
 - **aiter Triton GEMM configs may be suboptimal for your workload**: aiter Triton kernels use JSON config files at `aiter/ops/triton/configs/gemm/` with M-threshold entries. Default `"any"` fallbacks are typically tuned for large-batch training and may be poor for small-batch inference. Profile to find the dominant GEMM kernels, check their configs, and tune `BLOCK_SIZE_M` and `NUM_KSPLIT` for the actual runtime M value. Details: [references/gemm-and-linear.md](references/gemm-and-linear.md).
 
 ## Reference Files

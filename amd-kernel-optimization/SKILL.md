@@ -120,6 +120,124 @@ within a backend. Decision tree:
 - **Blind backend tuning without decode profiling**: If >40% of decode GPU time is "Other" / unidentified, do NOT proceed to GEMM config tuning. Fix profiling first (see gpu-profiling skill). The Phase 2C GLM-5.1 experiment spent 6 trials tuning CK GEMM configs while 46% of decode time was unprofiled Triton kernels.
 - **aiter Triton GEMM configs may be suboptimal for your workload**: aiter Triton kernels use JSON config files at `aiter/ops/triton/configs/gemm/` with M-threshold entries. Default `"any"` fallbacks are typically tuned for large-batch training and may be poor for small-batch inference. Profile to find the dominant GEMM kernels, check their configs, and tune `BLOCK_SIZE_M` and `NUM_KSPLIT` for the actual runtime M value. Details: [references/gemm-and-linear.md](references/gemm-and-linear.md).
 
+## Experiment Verification (learned from Phase 2C GLM-5.1 rerun)
+
+**Every config change MUST be verified via runtime logs before interpreting benchmark results.**
+A benchmark that completes without crashing is NOT proof the config change took effect — the runtime
+may silently fall back to defaults.
+
+### 1. Verbatim Dispatch Keys from Runtime Logs
+
+**NEVER infer dispatch keys from model architecture.** TP sharding, MoE expert routing, and
+quantization layout transform dimensions between model config and runtime dispatch.
+
+```bash
+# The runtime prints exact dispatch keys. Copy them VERBATIM:
+# For fused_moe: "[fused_moe] using 1stage default for (256, 1024, 6144, 256, 257, 9, ...)"
+# For individual GEMM: "[aiter] shape is M:512, N:2624, K:6144"
+# Use these exact values in your config CSV — do not reinterpret or remap field names.
+```
+
+- Model architecture `num_experts=256` → runtime dispatch may use `expert=257` (includes padding/sentinel)
+- Model architecture `hidden_size=6144` → after TP=8 sharding, runtime M/N/K differ
+- The field ordering in the log IS the field ordering in the CSV
+
+### 2. Separate Prefill vs Decode Dispatch Keys
+
+Prefill and decode use **different token counts** in the fused_moe dispatch key:
+- Prefill: `token=1024` (from `--input-len 1024` or `--batch-size 1024`)
+- Decode: `token=256` or smaller (depends on batch size, expert routing, TP sharding)
+
+**If you are optimizing DECODE latency, you MUST use the DECODE dispatch key.**
+Read the `[fused_moe]` log lines that appear DURING decode iterations, not during prefill.
+
+### 3. Three Dispatch Surfaces for MoE — Never Mix Them
+
+| Surface | Config File | Dispatch Key Type | Controls |
+|---------|------------|-------------------|----------|
+| **Fused MoE kernel** | `tuned_fmoe.csv` | `(cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1)` — 13-field composite key | MoE expert GEMM tiling (`block_m`, `ksplit`) + kernel binary selection |
+| **Individual FP8 GEMM** | `a8w8_blockscale_tuned_gemm.csv` | `(cu_num, M, N, K)` | Non-MoE FP8 GEMMs (attention projections) |
+| **BF16 fallback** | `bf16_tuned_gemm.csv` | `(cu_num, M, N, K)` | Non-MoE BF16 GEMMs |
+
+MoE expert GEMMs go through `fused_moe`, NOT through individual GEMM configs.
+Adding rows to `a8w8_blockscale_tuned_gemm.csv` will NOT affect MoE expert GEMM performance.
+
+**Note**: `cu_num` is a runtime dispatch-key value and may differ from the raw CU count
+reported by the hardware. Always copy it verbatim from the runtime log.
+
+### 4. Config File Chain Has 3 Layers
+
+aiter config loading reads from multiple sources and merges:
+
+1. **Source CSV**: `/sgl-workspace/aiter/aiter/configs/tuned_fmoe.csv` — the base config
+2. **Model-specific CSV**: `configs/model_configs/a8w8_blockscale_tuned_fmoe_<model>.csv` — merged into base
+3. **Runtime copy**: `/tmp/aiter_configs/tuned_fmoe.csv` — what the runtime actually reads
+
+**All three must be clean.** Fixing only the runtime copy is useless if the source is corrupted —
+`update_config_files()` in `jit/core.py` will re-copy from source on next launch, overwriting
+your fix.
+
+### 5. CSV Hygiene
+
+- Append with explicit newline: `echo "" >> file.csv` before appending a row
+- Verify field count: `awk -F',' '{print NF}' file.csv | sort -u` — all rows must match header
+- Check for concatenated rows: `awk -F',' 'NF!=25 {print NR": "NF" fields"}' file.csv`
+- Trailing commas create phantom empty fields — `sed -i 's/,$//' file.csv`
+- After editing, verify with `python3 -c "import pandas; pandas.read_csv('file.csv')"`
+
+### 6. Compiled vs Runtime Parameters
+
+**`block_m` in `tuned_fmoe.csv` is NOT a runtime-tunable parameter for the 2-stage CK path.**
+
+- **2-stage CK path** (`run_1stage=False`): `block_m` selects a pre-compiled CK kernel binary
+  via the `kernelName1`/`kernelName2` columns. The tile size is baked into the compiled `.so`.
+  You CANNOT change the actual tile size by editing `block_m` in the CSV — you need a kernel
+  binary that was compiled with that tile size (via aiter's tuning pipeline).
+
+- **1-stage Triton path** (`run_1stage=True`): `block_m` IS a runtime parameter — Triton JIT
+  compiles the kernel with the specified tile size on the fly. Use this path for quick
+  `block_m` experiments without needing pre-compiled kernels.
+
+**Rule**: If you need to test a `block_m` value and don't have matching CK binaries,
+use `run_1stage=True`. Only use `run_1stage=False` (2-stage CK) with tuner-generated
+configs that include matching compiled kernel names.
+
+### 7. Verify Config Effect, Not Just Config Load
+
+After a benchmark run, check the runtime log for evidence the tuned path was used:
+
+```bash
+# Good — config was found AND used:
+grep "Found tuned MoE config" bench.log    # → block_m=16, ksplit=0
+grep "using 2stage" bench.log              # → tuned 2-stage path
+
+# Bad — config fell back to defaults:
+grep "using 1stage default" bench.log      # → config NOT matched
+grep "run_1stage = True, block_m = 32" bench.log  # → default block_m, not your value
+```
+
+If the log shows default parameters after your config change, the benchmark result
+is a **baseline rerun**, not evidence about your optimization. Do NOT report it as
+"optimization X didn't help" — it was never exercised.
+
+### 8. Decode Dispatch Is Multi-Token
+
+`bench_one_batch` captures CUDA graphs at decreasing batch sizes, producing a **family**
+of token values in the fused_moe dispatch: `token=512, 256, 128, 64, 32, 16, 8, 4, 2, 1`.
+
+A single `tuned_fmoe.csv` row with one `token` value only covers ONE of these dispatch calls.
+The rest fall back to defaults. This means:
+
+- A "correctly keyed" config that only matches `token=512` leaves 9 other decode-path
+  dispatches on defaults — the benchmark result is a MIX of tuned and default behavior
+- To fully cover decode, you need either:
+  1. **N config rows** — one per token value in the family (impractical for heuristic injection)
+  2. **`run_1stage=True`** — Triton JIT applies `block_m` across all token values dynamically
+  3. **Aiter tuner** — generates the complete token-family config set
+
+**Rule**: For quick `block_m` experiments on decode, always use `run_1stage=True`.
+Only use 2-stage CK configs generated by the full aiter tuning pipeline.
+
 ## Reference Files
 
 Read as needed for implementation details:

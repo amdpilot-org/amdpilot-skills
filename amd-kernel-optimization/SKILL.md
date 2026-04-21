@@ -19,9 +19,9 @@ description: >
 
 ## Benchmarking (do this correctly or waste hours)
 
-**NEVER reduce warmup/iterations to "save time" — you get garbage numbers.**
+**NEVER cut the benchmark's documented warmup/measurement defaults to "save time" — you get garbage numbers.**
 
-- **Minimum**: 3 warmup runs, 10 measurement iterations. Use the benchmark script's defaults.
+- **Use the benchmark's documented warmup and measurement defaults.** Do not invent shorter one-off settings just to get a faster number.
 - **Use GPU timing**, not wall-clock:
   ```python
   start = torch.cuda.Event(enable_timing=True)
@@ -30,38 +30,67 @@ description: >
   torch.cuda.synchronize()
   ms = start.elapsed_time(end)
   ```
-- **Report mean AND std.** If std > 10% of mean, something is wrong (graph breaks, recompilation).
+- **Report mean AND std.** If std is roughly >10% of mean, treat that as a signal something is wrong (graph breaks, recompilation, unstable capture, or measurement noise).
 - **First-run penalty is NORMAL on AMD** — torch.compile takes 2-15 min on first run. Set timeout ≥ 600s. Do NOT conclude "compile doesn't work" or kill jobs under 15 min.
 - **Never report first-run latency as baseline.** Always use mean of post-warmup iterations.
 
+## Source-Level Changes Are Required
+
+**Env-var-only or config-flag-only optimization does NOT count as a valid optimization attempt.**
+Once a baseline is established and profiling identifies the hotspot, every scored optimization
+trial must include at least one tracked source code change. This means editing actual Python,
+C++, Triton, or HIP source files — not just setting environment variables or CLI flags.
+
+Examples of valid source-level changes:
+- Editing GEMM backend dispatch logic to select a faster kernel for the workload's shapes
+- Writing or tuning a Triton kernel for an elementwise fusion
+- Modifying attention implementation to use a faster backend
+- Changing CK/hipBLASLt tile configs or kernel instance factories
+- Fusing model operations (QKV projection fusion, gate+up fusion)
+
+Examples of changes that are NOT sufficient on their own:
+- Setting `PYTORCH_TUNABLEOP_ENABLED=1` or `TORCH_BLAS_PREFER_HIPBLASLT=1`
+- Passing `--use-flash-attn` as a CLI flag
+- Changing batch size or sequence length parameters
+- Setting env vars without touching source code
+
 ## Optimization Ladder
 
-Each level builds on the previous. **Do NOT skip to Level 3+ without Level 2.**
+Each level builds on the previous. **When the baseline is already established and the
+environment is pre-configured (most optimization tasks), skip Level 1 and start from
+profiling → Level 3+.** Only fall back to Level 1 if env vars are clearly misconfigured.
 
-### Level 1: Environment (no code changes)
+### Level 1: Environment (only if not already configured)
 - Set env vars: `GPU_MAX_HW_QUEUES=2`, `HIP_FORCE_DEV_KERNARG=1`, `HSA_NO_SCRATCH_RECLAIM=1`, `AMD_LOG_LEVEL=0`
 - Disable NUMA balancing: `sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'`
 - Enable GEMM tuning: `PYTORCH_TUNABLEOP_ENABLED=1`, `TORCH_BLAS_PREFER_HIPBLASLT=1`
 - Set `torch.set_float32_matmul_precision('high')`
 - Audit env vars: `env | grep -iE 'TORCH|INDUCTOR|AUTOTUNE'` — unset `TORCHINDUCTOR_MAX_AUTOTUNE` if present
+- **Skip this level** if the Docker image or benchmark script already sets these. Check first.
 
-### Level 2: torch.compile (MANDATORY — do this first)
+### Level 2: torch.compile (skip if already enabled in the benchmark)
 - Apply inductor config, compile with `mode="default"`. Details: [references/torch-compile-and-graphs.md](references/torch-compile-and-graphs.md)
 - Fix ALL graph breaks before Level 3: `TORCH_LOGS="graph_breaks" python3 ...`
 - If kernel launch overhead is high after compile, try manual CUDAGraph capture (see reference)
 - Before Level 3, capture a profiling snapshot so you know what compile fixed and what still dominates
 - This alone typically gives 2-5x speedup
+- **Skip this level** if the benchmark already uses torch.compile and the baseline is solid
 
-### Level 3: Model surgery (must preserve compile compatibility)
+### Level 3: Model surgery and backend switching (start here when baseline is established)
 - **Profile first** → read [references/benchmarking-and-profiling.md](references/benchmarking-and-profiling.md)
+- **Backend switching is a first-class optimization** — edit the dispatch/selection code to route
+  through a faster backend (CK, hipBLASLt, Triton, aiter) for the workload's dominant shapes.
+  This is a *source-level change* to the backend selection logic, not an env var.
 - Fuse QKV projections (3 GEMMs → 1), Gate+Up projections (2 GEMMs → 1) → [references/gemm-and-linear.md](references/gemm-and-linear.md)
 - Replace manual attention with SDPA or aiter flash attention → [references/gemm-and-linear.md](references/gemm-and-linear.md)
 - Look for compute-reduction: skip masked/padding inputs, avoid `repeat_kv`, cache unchanged outputs
 - **Test**: `TORCH_LOGS="graph_breaks"` — verify no new breaks after each change
 
-### Level 4: Kernel & inductor tuning
+### Level 4: Kernel-level optimization (Triton, CK tile configs, custom kernels)
 - Write Triton kernels for elementwise fusions (RMSNorm, SiLU+Mul, Add+RMSNorm) → [references/triton-on-rocm.md](references/triton-on-rocm.md)
 - Route fused GEMMs through aiter tuned GEMM with M-threshold gating → [references/gemm-and-linear.md](references/gemm-and-linear.md)
+- **Edit CK tile configs** — modify kernel config headers or instance factory files when profiling
+  indicates the current tile/layout choices do not fit the target architecture and GEMM shapes
 - Inductor tuning flags: `coordinate_descent_tuning`, `benchmark_kernel`, `freezing` (increase compile time, improve steady-state)
 
 ### Level 5: Architecture-specific kernels
@@ -69,29 +98,61 @@ Each level builds on the previous. **Do NOT skip to Level 3+ without Level 2.**
 - Weight preshuffling for asm paths (benchmark: may help or hurt per shape)
 - If custom kernel breaks compile, wrap with `@torch.compiler.disable` as last resort
 
+## Grouped GEMM Hot-Path Optimization
+
+For workloads where grouped GEMM dominates GPU time, the optimization target is the grouped GEMM
+dispatch and kernel selection logic, not just standalone GEMM backends.
+
+**Key source files to examine:**
+- The backend dispatch/selector that decides CK vs hipBLASLt vs Triton for grouped GEMM
+- The consumer-side integration of the grouped GEMM (e.g. the workload-specific wrapper or module class)
+- CK kernel configs and instance factories for the target GPU architecture
+- The surrounding data-movement / layout kernels around grouped GEMM (often a material share of total GPU time)
+
+**Optimization approach:**
+1. Profile to confirm grouped GEMM dominates (typically 20-40% of total GPU time)
+2. Identify which backend is currently active (CK, hipBLASLt, Triton)
+3. Edit the backend selection code to try alternatives — this is a *source code change*
+4. For CK backends: edit tile config headers to add architecture-specific tile sizes
+5. For surrounding data-movement / layout hotspots: look for fusion or layout-simplification opportunities
+
+For grouped-GEMM-dominated workloads, validate alternate grouped-GEMM backends through tracked
+source-level dispatch edits and comparative measurement. Do NOT lock onto a single library or
+kernel family by default; keep alternate backends in the scored lane and use profiling plus
+comparative throughput measurements to decide which path to keep.
+
+**Constraint awareness:**
+- Some grouped GEMM paths are coupled with surrounding scheduling or dispatch stages. Changing the
+  GEMM backend may require coordinated changes to those adjacent contracts.
+- Check for hard validation checks that reject incompatible flag combinations before making changes.
+
 ## AMD-Specific Alternatives Quick Reference
 
 ### GEMM / Linear
 | Option | Notes |
 |---|---|
 | rocBLAS (default) | Vendor BLAS; generally well-tuned |
-| hipBLASLt | Fused epilogues; may beat rocBLAS for some shapes |
+| hipBLASLt | Fused epilogues; may beat rocBLAS for some shapes. Note: some frameworks register hipBLASLt with `autotune=False` — it won't win autotune unless explicitly selected or patched. |
 | aiter tuned GEMM | Auto-dispatches best kernel per (M,N,K) from tuned configs |
-| FP8 GEMM (MI300+) | `gemm_a8w8` via aiter; gfx942=`e4m3fnuz`, gfx950=`e4m3fn` |
-| Triton FP8 GEMM | `--fp8-gemm-backend triton` — may be faster for decode (small M) on gfx950 |
+| CK GEMM | AMD Composable Kernel — tile configs in header files are architecture-specific |
+| FP8 GEMM (MI300+) | Backend-provided FP8 GEMM path; architecture-specific dtype handling can differ by target GPU |
+| Triton FP8 GEMM | Source-level backend candidate for small-shape or decode-heavy FP8 GEMM workloads; validate by comparative measurement, not by default |
 
-**Backend switching is a first-class optimization lever**, separate from config tuning
-within a backend. Decision tree:
+**Backend switching is a source-level optimization**, not config tuning. Edit the dispatch
+code that selects which backend runs for each GEMM shape. Decision tree:
 1. Profile first → identify top hotspot kernel and its backend
-2. If hotspot is CK GEMM and workload is decode (small M) → try Triton FP8 GEMM
-3. If hotspot is "Other/Triton" → check Triton config JSON for gfx950 entries
+2. If a single backend dominates the hotspot, validate alternate backends through tracked
+   source-level dispatch edits and comparative measurement instead of prescribing a direction
+   up front; let runtime evidence decide which backend to keep.
+3. If the hotspot kernel name is opaque (for example, it shows up as a generic
+   `Other/<framework>` bucket in the profiler), inspect that framework's per-architecture
+   config files for the target GPU before changing dispatch behavior.
 4. Do NOT spend >3 rounds tuning configs within one backend without profiling verification
 
-**WARNING — FP8 dtype differs by GPU architecture:**
-- gfx942 (MI300X): `torch.float8_e4m3fnuz` — hardware only supports FNUZ
-- gfx950 (MI355X): `torch.float8_e4m3fn` — hardware supports both, aiter chooses IEEE
-- Do NOT assume `is_fp8_fnuz()` should return True for all AMD GPUs
-- Check: `aiter/ops/triton/utils/types.py` → `get_fp8_dtypes()`
+**WARNING — FP8 dtype handling differs by GPU architecture and backend runtime:**
+- Check the active backend/runtime helper that selects FP8 dtypes for the target GPU before changing dispatch or backend config files.
+- Do NOT assume one FP8 format is valid on every AMD architecture.
+- Re-verify dtype selection after backend changes or runtime upgrades.
 
 ### Attention
 | Option | Notes |
@@ -109,134 +170,18 @@ within a backend. Decision tree:
 
 ## Common Pitfalls
 
+- **Relying on env vars / CLI flags instead of source changes**: Setting env vars like `PYTORCH_TUNABLEOP_ENABLED=1` or passing `--use-flash-attn` is NOT optimization. Edit the actual source code — backend dispatch logic, kernel configs, model implementation files. Env-var-only trials with no source edits do not count as optimization attempts.
 - **Optimizing without profiling**: Classify kernels by category (GEMM/attention/elementwise/other) and compute percentages. "Top 10 kernels" is not enough.
-- **Skipping torch.compile**: Manual fusion that saves 10% is worthless if you're missing the 3x from compile. Get compile working first.
+- **Skipping torch.compile**: Manual fusion that saves 10% is worthless if you're missing the 3x from compile. Get compile working first — but if compile is already enabled in the baseline, skip to source-level optimization.
 - **Giving up on first failure**: When a technique causes regression, diagnose and adjust (e.g., M-threshold gating for aiter GEMM), don't abandon it entirely.
-- **Treating blockers as dead ends**: "CUDAGraph doesn't support control flow" means "refactor the control flow." "Requires editing HuggingFace modeling file" means "go edit the modeling file" — that IS the work.
-- **Not modifying inner model layers**: The hottest code is in attention and MLP modules, often in third-party libraries. Locate them: `python -c "import transformers; print(transformers.__file__)"` and edit directly.
+- **Treating blockers as dead ends**: "CUDAGraph doesn't support control flow" means "refactor the control flow." "Requires editing HuggingFace modeling file" means "go edit the modeling file" — that IS the work. Source-level changes are the goal, not the obstacle.
+- **Not modifying inner model layers**: The hottest code is in attention and MLP modules, often in third-party libraries. Locate them: `python -c "import transformers; print(transformers.__file__)"` and edit directly. Editing library internals is expected and encouraged.
 - **Testing only in isolation**: Optimizations compose. A technique showing 0% alone may enable others. Build incrementally — each new technique applied ON TOP of all previous ones.
-- **Reducing benchmark parameters**: Setting `WARMUP=0 ITERATIONS=1` gives meaningless numbers. Optimize the code, not the test.
-- **aiter tuned GEMM with no tuned configs**: Default config CSV ships empty — `gemm_a16w16` silently falls back to `F.linear` (no error, no benefit). Diagnose: `AITER_LOG_TUNED_CONFIG=1`; if "using torch solution:0", generate configs or use `PYTORCH_TUNABLEOP_ENABLED=1`. Full workflow: [references/gemm-and-linear.md](references/gemm-and-linear.md).
-- **Blind backend tuning without decode profiling**: If >40% of decode GPU time is "Other" / unidentified, do NOT proceed to GEMM config tuning. Fix profiling first (see gpu-profiling skill). The Phase 2C GLM-5.1 experiment spent 6 trials tuning CK GEMM configs while 46% of decode time was unprofiled Triton kernels.
-- **aiter Triton GEMM configs may be suboptimal for your workload**: aiter Triton kernels use JSON config files at `aiter/ops/triton/configs/gemm/` with M-threshold entries. Default `"any"` fallbacks are typically tuned for large-batch training and may be poor for small-batch inference. Profile to find the dominant GEMM kernels, check their configs, and tune `BLOCK_SIZE_M` and `NUM_KSPLIT` for the actual runtime M value. Details: [references/gemm-and-linear.md](references/gemm-and-linear.md).
-
-## Experiment Verification (learned from Phase 2C GLM-5.1 rerun)
-
-**Every config change MUST be verified via runtime logs before interpreting benchmark results.**
-A benchmark that completes without crashing is NOT proof the config change took effect — the runtime
-may silently fall back to defaults.
-
-### 1. Verbatim Dispatch Keys from Runtime Logs
-
-**NEVER infer dispatch keys from model architecture.** TP sharding, MoE expert routing, and
-quantization layout transform dimensions between model config and runtime dispatch.
-
-```bash
-# The runtime prints exact dispatch keys. Copy them VERBATIM:
-# For fused_moe: "[fused_moe] using 1stage default for (256, 1024, 6144, 256, 257, 9, ...)"
-# For individual GEMM: "[aiter] shape is M:512, N:2624, K:6144"
-# Use these exact values in your config CSV — do not reinterpret or remap field names.
-```
-
-- Model architecture `num_experts=256` → runtime dispatch may use `expert=257` (includes padding/sentinel)
-- Model architecture `hidden_size=6144` → after TP=8 sharding, runtime M/N/K differ
-- The field ordering in the log IS the field ordering in the CSV
-
-### 2. Separate Prefill vs Decode Dispatch Keys
-
-Prefill and decode use **different token counts** in the fused_moe dispatch key:
-- Prefill: `token=1024` (from `--input-len 1024` or `--batch-size 1024`)
-- Decode: `token=256` or smaller (depends on batch size, expert routing, TP sharding)
-
-**If you are optimizing DECODE latency, you MUST use the DECODE dispatch key.**
-Read the `[fused_moe]` log lines that appear DURING decode iterations, not during prefill.
-
-### 3. Three Dispatch Surfaces for MoE — Never Mix Them
-
-| Surface | Config File | Dispatch Key Type | Controls |
-|---------|------------|-------------------|----------|
-| **Fused MoE kernel** | `tuned_fmoe.csv` | `(cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1)` — 13-field composite key | MoE expert GEMM tiling (`block_m`, `ksplit`) + kernel binary selection |
-| **Individual FP8 GEMM** | `a8w8_blockscale_tuned_gemm.csv` | `(cu_num, M, N, K)` | Non-MoE FP8 GEMMs (attention projections) |
-| **BF16 fallback** | `bf16_tuned_gemm.csv` | `(cu_num, M, N, K)` | Non-MoE BF16 GEMMs |
-
-MoE expert GEMMs go through `fused_moe`, NOT through individual GEMM configs.
-Adding rows to `a8w8_blockscale_tuned_gemm.csv` will NOT affect MoE expert GEMM performance.
-
-**Note**: `cu_num` is a runtime dispatch-key value and may differ from the raw CU count
-reported by the hardware. Always copy it verbatim from the runtime log.
-
-### 4. Config File Chain Has 3 Layers
-
-aiter config loading reads from multiple sources and merges:
-
-1. **Source CSV**: `/sgl-workspace/aiter/aiter/configs/tuned_fmoe.csv` — the base config
-2. **Model-specific CSV**: `configs/model_configs/a8w8_blockscale_tuned_fmoe_<model>.csv` — merged into base
-3. **Runtime copy**: `/tmp/aiter_configs/tuned_fmoe.csv` — what the runtime actually reads
-
-**All three must be clean.** Fixing only the runtime copy is useless if the source is corrupted —
-`update_config_files()` in `jit/core.py` will re-copy from source on next launch, overwriting
-your fix.
-
-### 5. CSV Hygiene
-
-- Append with explicit newline: `echo "" >> file.csv` before appending a row
-- Verify field count: `awk -F',' '{print NF}' file.csv | sort -u` — all rows must match header
-- Check for concatenated rows: `awk -F',' 'NF!=25 {print NR": "NF" fields"}' file.csv`
-- Trailing commas create phantom empty fields — `sed -i 's/,$//' file.csv`
-- After editing, verify with `python3 -c "import pandas; pandas.read_csv('file.csv')"`
-
-### 6. Compiled vs Runtime Parameters
-
-**`block_m` in `tuned_fmoe.csv` is NOT a runtime-tunable parameter for the 2-stage CK path.**
-
-- **2-stage CK path** (`run_1stage=False`): `block_m` selects a pre-compiled CK kernel binary
-  via the `kernelName1`/`kernelName2` columns. The tile size is baked into the compiled `.so`.
-  You CANNOT change the actual tile size by editing `block_m` in the CSV — you need a kernel
-  binary that was compiled with that tile size (via aiter's tuning pipeline).
-
-- **1-stage Triton path** (`run_1stage=True`): `block_m` IS a runtime parameter — Triton JIT
-  compiles the kernel with the specified tile size on the fly. Use this path for quick
-  `block_m` experiments without needing pre-compiled kernels.
-
-**Rule**: If you need to test a `block_m` value and don't have matching CK binaries,
-use `run_1stage=True`. Only use `run_1stage=False` (2-stage CK) with tuner-generated
-configs that include matching compiled kernel names.
-
-### 7. Verify Config Effect, Not Just Config Load
-
-After a benchmark run, check the runtime log for evidence the tuned path was used:
-
-```bash
-# Good — config was found AND used:
-grep "Found tuned MoE config" bench.log    # → block_m=16, ksplit=0
-grep "using 2stage" bench.log              # → tuned 2-stage path
-
-# Bad — config fell back to defaults:
-grep "using 1stage default" bench.log      # → config NOT matched
-grep "run_1stage = True, block_m = 32" bench.log  # → default block_m, not your value
-```
-
-If the log shows default parameters after your config change, the benchmark result
-is a **baseline rerun**, not evidence about your optimization. Do NOT report it as
-"optimization X didn't help" — it was never exercised.
-
-### 8. Decode Dispatch Is Multi-Token
-
-`bench_one_batch` captures CUDA graphs at decreasing batch sizes, producing a **family**
-of token values in the fused_moe dispatch: `token=512, 256, 128, 64, 32, 16, 8, 4, 2, 1`.
-
-A single `tuned_fmoe.csv` row with one `token` value only covers ONE of these dispatch calls.
-The rest fall back to defaults. This means:
-
-- A "correctly keyed" config that only matches `token=512` leaves 9 other decode-path
-  dispatches on defaults — the benchmark result is a MIX of tuned and default behavior
-- To fully cover decode, you need either:
-  1. **N config rows** — one per token value in the family (impractical for heuristic injection)
-  2. **`run_1stage=True`** — Triton JIT applies `block_m` across all token values dynamically
-  3. **Aiter tuner** — generates the complete token-family config set
-
-**Rule**: For quick `block_m` experiments on decode, always use `run_1stage=True`.
-Only use 2-stage CK configs generated by the full aiter tuning pipeline.
+- **Reducing benchmark parameters**: Stripping warmup down to near-zero or running only a token number of measured iterations gives meaningless numbers. Optimize the code, not the test.
+- **Tuned GEMM path with no tuned configs**: Some backends ship broad defaults or incomplete tuned-config coverage and silently fall back to a slower generic path. Diagnose by enabling the active backend's tuned-config logging and checking whether the hot GEMM path is actually using the intended tuned kernel; if not, generate the needed configs or route through a tuned backend path. Full workflow: [references/gemm-and-linear.md](references/gemm-and-linear.md).
+- **Blind backend tuning without decode profiling**: If a large share of decode GPU time remains in "Other" / unidentified buckets, do NOT proceed to backend config tuning. Fix profiling first (see gpu-profiling skill).
+- **Backend config defaults may be suboptimal for your workload**: backend config files and threshold/tile parameters often ship with broad defaults that fit one shape regime better than another. Profile to find the dominant GEMM kernels, inspect the active config path for those shapes, and tune threshold/tile parameters only after the hot path and runtime shapes are pinned. Details: [references/gemm-and-linear.md](references/gemm-and-linear.md).
+- **Treating backend env vars as optimization**: `*_GROUPED_GEMM_BACKEND` or similar env vars can force backend selection for diagnostics, but the scored optimization must land as a tracked source code edit (e.g., editing the dispatch function, adding an architecture-specific tile config, patching the backend selection logic).
 
 ## Reference Files
 

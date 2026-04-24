@@ -140,7 +140,7 @@ explanation of each setting and when you might want to override them.
 
 - **amd-rocm-porting**: Run env-probe as Phase 0.5 (after Phase 0 environment setup, before Phase 1 porting)
 - **amd-kernel-optimization**: Run env-probe before profiling baseline
-- **gpu-profiling**: Probe checks that rocprofv3 is available and functional
+- **gpu-profiling**: Probe verifies `torch.profiler` can capture GPU activity (torch version + ROCm runtime healthy)
 
 ## Adding New Checks
 

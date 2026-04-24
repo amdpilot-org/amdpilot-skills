@@ -53,31 +53,18 @@ Wall-clock `time.time()` includes Python overhead and scheduling noise — never
 ### CRITICAL: Profiling adds 2-5x overhead. Profiled latency ≠ real latency.
 Profile tells you WHERE time is spent, not absolute performance. Measure real latency separately.
 
-### rocprof (AMD-native, fastest for kernel-level profiling)
+### torch.profiler (primary tool for all kernel breakdowns on AMD)
 
-`rocprof` is the AMD-native profiling tool. Use it to quickly identify which GPU kernels dominate execution time **before** making any optimization decisions.
+`torch.profiler` is the default profiling tool on AMD ROCm. It captures GPU
+kernel timings reliably under both eager and `torch.compile` paths, and its
+Chrome-trace output is easy to parse. Use it to identify which GPU kernels
+dominate execution time **before** making any optimization decisions.
 
-```bash
-# Basic stats: shows kernel names, call counts, total/average time, percentage
-rocprof --stats /opt/venv/bin/python3 your_script.py 2>&1 | tail -40
-```
-
-**Output format:**
-```
-Name                                    Calls   TotalDurationNs  AverageNs    Percentage
-fused_moe_kernel                        120     1842000000       15350000     86.9%
-triton_poi_fused_softmax                40      128000000        3200000      6.0%
-Cijk_Ailk_Bljk_HHS_BH_MT128x128x16    20      85000000         4250000      4.0%
-```
-
-**How to interpret:**
-- **Percentage column** tells you where time is spent. Focus on the top 1-3 kernels.
-- **Calls × AverageNs** = total time. High call count with low average = launch overhead. Low call count with high average = compute-bound.
-- **Kernel name patterns**: `fused_moe_kernel` = MoE dispatch, `Cijk_*` = rocBLAS GEMM, `triton_*` = Triton-compiled kernel
-
-**When to use rocprof vs torch.profiler:**
-- `rocprof --stats`: Fast (seconds), gives kernel-level breakdown. Use first.
-- `torch.profiler`: Slower, gives Python-level + operator-level view. Use for deeper analysis.
+Historical attempts to use `rocprofv3 --attach` / wrap-launch on large models
+have routinely OOMed or produced no output under multi-process torchrun. The
+kernel-category breakdown from `torch.profiler` is sufficient to choose
+where to optimize — do not escalate to HSA-level tooling unless
+`torch.profiler` cannot identify the hotspot at all.
 
 ### torch.profiler (for detailed operator-level analysis)
 

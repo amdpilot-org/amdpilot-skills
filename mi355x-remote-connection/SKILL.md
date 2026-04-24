@@ -225,7 +225,7 @@ rm -rf /tmp/verify-*
 | **env-probe** | Run env-probe inside the container after Step 3 for deep environment analysis |
 | **amd-rocm-porting** | Use this skill as Phase 0 before starting any porting work |
 | **amd-kernel-optimization** | Validate node health before profiling baseline |
-| **gpu-profiling** | Confirm rocprofv3 availability and GPU state before trace collection |
+| **gpu-profiling** | Confirm GPU state is healthy before running `torch.profiler` trace collection |
 
 ## Model Loading Priority
 

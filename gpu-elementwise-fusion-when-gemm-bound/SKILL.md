@@ -97,7 +97,7 @@ Every imported fusion intuition must be translated explicitly:
 | Upstream / NVIDIA-style assumption | AMD / ROCm translation | Validate with |
 | --- | --- | --- |
 | one fused epilogue exists behind a CUDA-only flag | prefer source-level fusion, Triton fusion, Inductor epilogue fusion, or backend-native fused path on ROCm | before/after trace shows fewer kernels or lower elementwise share |
-| Nsight view is enough to identify memory-bound chains | use `torch.profiler` and `rocprofv3` to recover repeated kernel chains and launch counts on AMD | trace names, source scopes, and launch counts are recoverable |
+| Nsight view is enough to identify memory-bound chains | use `torch.profiler` (Chrome trace + kernel aggregation) to recover repeated kernel chains and launch counts on AMD | trace names, source scopes, and launch counts are recoverable |
 | CUDA graphs hide launch overhead but are still safe to reason about | HIP graph / compile paths can also hide chains; keep a profiling path with graphs relaxed if needed | profiling path clearly exposes the unfused chain |
 | cuBLAS epilogue fusion is the only way to win | ROCm may win through Triton/Inductor fusion or source-level multi-op collapse instead | backend path and kernel count are visible in artifacts |
 | one activation family implies one remedy | keep the skill generic across activation, normalization, residual, and cast chains | the trigger is based on profile share and chain shape, not model-specific names |

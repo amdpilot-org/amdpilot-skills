@@ -8,21 +8,24 @@ The `fused_moe_triton` kernel in sglang uses JSON config files to control Triton
 
 **Do NOT skip to tuning. You must profile first.**
 
-### Step 1: Profile with rocprof
+### Step 1: Profile with torch.profiler
 
-Run `rocprof --stats` on the benchmark to see which kernels dominate GPU time:
+Run `torch.profiler` (or your framework's built-in profiling endpoint) on the
+benchmark, dump a Chrome trace, and parse it to see which kernels dominate GPU
+time. The workflow is in the `gpu-profiling` skill — summary:
 
-```bash
-rocprof --stats /opt/venv/bin/python3 /workspace/test_harness.py 2>&1 | tail -40
+```python
+from torch.profiler import profile, ProfilerActivity
+
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    # run a few iterations of the benchmark
+    ...
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+prof.export_chrome_trace("/tmp/trace.json")
 ```
 
-The output will look like:
-```
-Name                                    Calls   TotalDurationNs  AverageNs    Percentage
-fused_moe_kernel                        120     1842000000       15350000     86.9%
-triton_poi_fused_softmax                40      128000000        3200000      6.0%
-...
-```
+Then aggregate by kernel name from the trace JSON to get a percent
+breakdown.
 
 **What to look for:**
 - Which kernel takes the most GPU time (should be `fused_moe_kernel` at 80%+)
@@ -104,4 +107,4 @@ Check per-batch-size speedups. If small M (512, 2048) shows <1.3x speedup, you n
 
 4. **Fabricating configs without benchmarking** — A config with BLOCK_SIZE_M=256 might seem fast but can crash due to shared memory limits. Always benchmark.
 
-5. **Not profiling again after tuning** — Run `rocprof --stats` after applying configs to verify the kernel actually sped up. Variance can fool you.
+5. **Not profiling again after tuning** — Re-run `torch.profiler` after applying configs to verify the target kernel actually sped up. Variance can fool you.

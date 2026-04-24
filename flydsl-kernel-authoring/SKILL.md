@@ -244,6 +244,53 @@ correct.
    Only set `FLYDSL_RUNTIME_ENABLE_CACHE=0` when modifying C++ passes or
    non-closure helper functions in the FlyDSL source itself.
 
+10. **LDS (shared memory) budget is a HARDWARE limit — check before scaling
+    tiles.** The error ``out of resource: shared memory, Required: X, Hardware
+    limit: Y`` means the kernel requested more LDS than the target CU has.
+    Per-CU LDS budgets are fixed:
+
+    | GPU arch | GPU chip | LDS per CU |
+    |---|---|---|
+    | gfx942 | MI300X / MI308X |  64 KB |
+    | gfx950 | MI350 / MI355X | 160 KB (163 840 bytes) |
+    | gfx1250 | MI450 | 160 KB |
+
+    For a standard double-buffered GEMM kernel, LDS usage scales roughly as:
+
+    ```
+    lds_bytes  ≈  (BLOCK_M * BLOCK_K  +  BLOCK_K * BLOCK_N)
+                    * dtype_bytes
+                    * num_stages
+    ```
+
+    Concrete guard (the missing check that caused the real-world failure we
+    observed: `BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, num_stages=3, bf16`
+    wants 192 KB on gfx950's 160 KB limit):
+
+    ```python
+    def _lds_ok(BLOCK_M, BLOCK_N, BLOCK_K, num_stages, dtype_bytes, arch="gfx950"):
+        lds_limit = {"gfx942": 65536, "gfx950": 163840, "gfx1250": 163840}[arch]
+        needed = (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * dtype_bytes * num_stages
+        return needed <= lds_limit
+
+    # When accepting autotune / origami / hand-picked configs, always check:
+    if not _lds_ok(BLOCK_M, BLOCK_N, BLOCK_K, num_stages, 2, "gfx950"):
+        # fall back to the safe default, e.g. (128, 128, 64, 2)
+        BLOCK_M, BLOCK_N, BLOCK_K, num_stages = 128, 128, 64, 2
+    ```
+
+    If the kernel is not in your own code (e.g. you're relaxing a
+    library-side guard so an autotune suggestion with a larger
+    `BLOCK_K` is accepted), the LDS check MUST be added to that
+    selection path — otherwise isolation-benchmark-passing configs
+    will crash at verification time on different shapes.
+
+    Separately: epilogue storage, `cache_a` / `cache_b` preshuffle buffers,
+    and register spills also count against the CU's LDS budget. When
+    adjacent kernels share a stream, their LDS is not additive (each
+    kernel has exclusive access during its launch) — only one kernel's
+    budget needs to fit. But within one kernel, everything must fit.
+
 ## Reference files
 
 These reference docs (trimmed from the FlyDSL repository) cover the patterns in

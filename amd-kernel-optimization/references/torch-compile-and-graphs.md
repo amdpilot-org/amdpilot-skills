@@ -1,5 +1,26 @@
 # torch.compile and CUDAGraph on ROCm (Performance)
 
+## API: use `torch.compile`, NOT `torch._dynamo.optimize`
+
+The public API is `torch.compile(fn, mode="default")`. Older PyTorch
+tutorials and some internal PyTorch code reference `torch._dynamo.optimize`
+— that is the **legacy name for the same machinery** and is no longer the
+recommended entry point. Both accept similar arguments (e.g. `mode=`),
+which makes the confusion easy. To avoid silently invoking the wrong
+code path:
+
+- Always wrap with `torch.compile(fn, mode="default")`.
+- **Never** call `torch._dynamo.optimize(fn, ...)` to "compile" a function
+  in new code; it is a private symbol and its observable behaviour can
+  diverge from `torch.compile`.
+- It is fine to import `torch._dynamo.config` to tune dynamo settings
+  (`dynamo_config.cache_size_limit = 128` etc.) — that is the documented
+  configuration surface, not the compile entry point.
+
+If you find yourself writing `torch._dynamo.optimize(...)` you have
+reached for the wrong API; switch to `torch.compile(...)` before
+benchmarking.
+
 ## Step 0: Audit Environment Variables
 
 **Run this before your first torch.compile attempt:**

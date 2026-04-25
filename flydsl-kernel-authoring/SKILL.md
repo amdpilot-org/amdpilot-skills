@@ -76,6 +76,29 @@ When the image supports FlyDSL, `FLYDSL_ROOT=/opt/FlyDSL`, `PYTHONPATH` already
 contains the FlyDSL package paths, and `LD_LIBRARY_PATH` contains the MLIR libs.
 Do NOT re-export these yourself in the main shell — they are set image-wide.
 
+## Existing kernels are HEADSTART code — inventory `/opt/FlyDSL/kernels/` FIRST
+
+Before authoring any new kernel, list `/opt/FlyDSL/kernels/`. The directory
+ships ready-made kernels covering most common ops: RMSNorm, fused add+RMSNorm,
+LayerNorm, softmax, preshuffle GEMM, attention. Each is a complete, tested
+implementation that builds correctly.
+
+```bash
+ls /opt/FlyDSL/kernels/*.py
+```
+
+If a kernel matching your hotspot already exists, your job is to:
+
+1. Read that kernel — it solves the FlyDSL API issues for that operation
+   class (vector types, `reduce`, `copy_atom_call`, layout divides).
+2. Use it as the starting point for your dispatcher / integration.
+3. Only modify it for shape-specific tile sizes.
+
+Authoring the same kernel from scratch when a working sample exists is the
+single most common way to burn the FlyDSL trial. The MLIR-style errors you
+will hit ("`reduce` on ArithValue", "memref type mismatch", "vector
+broadcast required") are all already-solved problems in the sample kernels.
+
 ## Integration playbook (the only pattern that consistently works)
 
 The safe way to deploy a FlyDSL kernel into a live PyTorch / training run:
@@ -290,6 +313,97 @@ correct.
     adjacent kernels share a stream, their LDS is not additive (each
     kernel has exclusive access during its launch) — only one kernel's
     budget needs to fit. But within one kernel, everything must fit.
+
+## Recovery patterns — when you hit a FlyDSL API error
+
+These are the most common stumbles authors hit on a first FlyDSL kernel.
+Each has a worked recovery rather than "give up and abandon the hotspot".
+
+### "`reduce` on ArithValue" / "vector type required for `reduce`"
+
+`reduce()` and `wave_reduce_add()` operate on **vector types**, not on the
+scalar `ArithValue` you get from a single load or arithmetic op. The fix
+is to keep the data in vector form through the full reduction chain:
+
+```python
+# WRONG — `x_safe` becomes a scalar after the select, reduce() fails:
+x_vec   = fx.memref_load_vec(r).to(Float32)
+x_safe  = is_valid.select(x_vec, Float32(0.0))   # ArithValue
+sq      = (x_safe * x_safe).reduce(...)           # crash
+
+# RIGHT — keep the operand a vector, mask via vector select:
+x_vec    = fx.memref_load_vec(r).to(Float32)
+zero_vec = fx.vec_broadcast(Float32(0.0), shape=x_vec.shape)
+x_safe   = fx.vec_select(is_valid_vec, x_vec, zero_vec)  # still a vector
+sq       = (x_safe * x_safe).reduce(...)                  # OK
+```
+
+The existing `kernels/layernorm_kernel.py` and `kernels/rmsnorm_kernel.py`
+both do exactly this — read them once, then mimic the pattern.
+
+### Shape-divisibility — your tile must divide the shape
+
+`out of resource: shape not divisible` (and silent "wrong-output" bugs) come
+from picking a tile that does not divide the workload dimension. The fix is
+simple: pick a tile that does. Worked example for the Qwen3-30B-A3B
+hidden_size = **2560** (a non-power-of-2 that breaks naive 2048 / 1024 tiles):
+
+```text
+hidden_size = 2560 = 2^9 · 5
+
+Valid tile choices (divide 2560 evenly):
+  256  → 10 columns of work per row
+  320  →  8 columns of work per row
+  512  →  5 columns of work per row
+  640  →  4 columns of work per row
+
+Invalid tile choices for this hidden_size:
+  1024 → 2.5 columns — leaves a remainder
+  2048 → 1.25 columns — leaves a remainder
+```
+
+In the kernel, set `BLOCK_N` (the per-row column tile) to the chosen size:
+
+```python
+BLOCK_N = 256          # divides hidden_size=2560
+NCOLS   = N // BLOCK_N # exact, no remainder
+for j in range(NCOLS):
+    ...
+```
+
+If the workload's shape genuinely cannot be divided by any reasonable tile
+(e.g. a prime hidden_size), use a masked tail loop pattern from
+`kernels/rmsnorm_kernel.py` — but that is the exception, not the default.
+
+### "Custom kernel works in isolation but doesn't move e2e"
+
+The skill's golden rule says: stack with `torch.compile(mode="default")`.
+Some authors skip this step because they observed `torch.compile` regress
+on the same model in an earlier trial without the custom kernel. **That
+observation is not transferable to the compile + custom-kernel pair.**
+The Python dispatch overhead on a freshly-allocated output tensor — which
+your custom kernel introduces — is what `torch.compile` is best at
+removing. Always measure (a) baseline, (b) custom kernel without compile,
+(c) custom kernel WITH compile. (c) is the one expected to win.
+
+### "Custom kernel claims a win in isolation but verification disagrees"
+
+The most common cause is dispatcher routing: your hot path is calling the
+ORIGINAL library op, not your FlyDSL kernel. Sanity check:
+
+```python
+# Add a one-line print at the top of the FlyDSL dispatcher:
+def _flydsl_dispatch(x, weight, eps):
+    print(f"[flydsl_path] M={x.shape[0]} N={x.shape[1]} dtype={x.dtype}", flush=True)
+    ...
+```
+
+Run one iteration. If the line never fires, your patch did not reach the
+hot module (common with torchrun's process tree caching `sys.modules`); use
+the loader pattern from gotcha #1 above. If it fires but the count is
+suspiciously low compared to the expected number of layers, your dispatcher
+is falling through to the reference op for shapes it should handle —
+inspect the shape filter.
 
 ## Reference files
 

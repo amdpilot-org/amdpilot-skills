@@ -76,108 +76,155 @@ When the image supports FlyDSL, `FLYDSL_ROOT=/opt/FlyDSL`, `PYTHONPATH` already
 contains the FlyDSL package paths, and `LD_LIBRARY_PATH` contains the MLIR libs.
 Do NOT re-export these yourself in the main shell — they are set image-wide.
 
-## ABI compatibility — your workload's Python must match FlyDSL's `.so` ABI
+## Find a Python that can actually USE FlyDSL — discovery first
 
-FlyDSL ships as a set of compiled extensions tagged for a specific CPython
-ABI (e.g. `_mlir.cpython-310-x86_64-linux-gnu.so`). The image's `/opt/FlyDSL`
-directory may exist, but the `.so` files only load if the Python you're
-running matches that ABI tag. Workloads commonly run a venv-managed Python
-(uv, conda, plain venv) that differs from the image's system Python — for
-example, a workload whose `pyproject.toml` requires `python>=3.11` runs in a
-3.11 venv even when the image's `/opt/FlyDSL` was built for 3.10.
+FlyDSL ships as compiled C++ extensions tagged for a specific CPython
+ABI (e.g. `_mlir.cpython-310-x86_64-linux-gnu.so`). Images that
+"have FlyDSL" usually expose it in two ways:
 
-**Verify the import in the SAME Python interpreter your benchmark uses.**
-Recipe to detect the ABI mismatch up front:
+1. **A pip-installed FlyDSL**, sitting in some venv's
+   `site-packages/flydsl/` directory with a `.dist-info`. This is the
+   *intended* way to use FlyDSL — its symlinks resolve, its dependencies
+   are pinned, and `flydsl.compile(module)` round-trips cleanly.
+2. **A raw build directory** at `/opt/FlyDSL/build-fly/python_packages/`
+   left over from the image build process. This directory has dangling
+   symlinks (e.g., `_mlir/ir.py` -> `/workspace/llvm-project/.../ir.py`
+   that no longer exists) and importing from it bypasses the proper
+   pip dependency resolution. **Do not put this on PYTHONPATH** — it
+   shadows the working pip-installed flydsl with a broken view.
+
+The image's pre-set `PYTHONPATH=/opt/FlyDSL/build-fly/python_packages:/opt/FlyDSL`
+is **not** a recommendation; it's a holdover from the build environment
+that actively breaks downstream imports. Step 0 of any FlyDSL work is
+to find the right Python and DROP the bad PYTHONPATH.
+
+### Step 0a — discovery: which Python actually has FlyDSL?
 
 ```bash
-# 1. Find the workload's Python (the one your benchmark uses).
-WORKLOAD_PY=$(find /workspace -maxdepth 4 -path '*/.venv/bin/python' -type f 2>/dev/null | head -1)
-WORKLOAD_PY="${WORKLOAD_PY:-$(which python3)}"
+# Always start with PYTHONPATH cleared. Globally-set PYTHONPATH is the
+# #1 source of "import flydsl crashes nanobind" symptoms.
+unset PYTHONPATH
 
-# 2. Try the import. Note: PYTHONPATH must be set inline ONLY for this
-# call — do NOT export it to the shell, and do NOT add it to
-# bench_config.env. The workload's PyTorch / openpi / etc. imports
-# will break if a `/opt/FlyDSL/build-fly/python_packages` entry leaks
-# into a Python whose ABI doesn't match the FlyDSL .so files.
-"$WORKLOAD_PY" --version
-PYTHONPATH=/opt/FlyDSL/build-fly/python_packages:/opt/FlyDSL "$WORKLOAD_PY" \
-    -c 'import flydsl; print("flydsl OK at", flydsl.__file__)'
+# A. Check the workload's Python (the one your benchmark already uses).
+WORKLOAD_PY=$(find /workspace -maxdepth 5 -path '*/.venv/bin/python' -type f 2>/dev/null | head -1)
+WORKLOAD_PY="${WORKLOAD_PY:-$(which python3)}"
+"$WORKLOAD_PY" -c 'import flydsl, sys; print("WORKLOAD_PY OK:", flydsl.__file__, sys.version_info[:2])' 2>&1 | head -3
+
+# B. Check well-known image Pythons that may host FlyDSL pip-installed.
+#    Common locations: /opt/venv (rocm/sgl-dev images), /opt/conda (anaconda),
+#    /opt/python*. Do not stop at the first match — you want one whose
+#    `flydsl.compile(...)` actually works, see Step 0b.
+for cand in /opt/venv/bin/python /opt/conda/bin/python /usr/bin/python3 \
+           $(ls /opt/uv-pythons/cpython-*/bin/python 2>/dev/null); do
+    [ -x "$cand" ] || continue
+    if "$cand" -c 'import flydsl' 2>/dev/null; then
+        echo "candidate FLYDSL_PY: $cand ($("$cand" --version))"
+    fi
+done
 ```
 
-If the import fails with `nanobind`-style aborts, `_PyType_AddSubclass` not
-found, `cpython-3XX` mismatch errors, or `ModuleNotFoundError: flydsl`, the
-ABI is mismatched. **Do not give up on FlyDSL** — work through the
-following tiers in order:
+If `WORKLOAD_PY` itself imports flydsl cleanly, you're in the easy case
+— skip ahead to "Once you have a working FLYDSL_PY".
 
-### Tier 1 (preferred): install a parallel matching Python via uv
+If `WORKLOAD_PY` fails but a `/opt/venv` (or similar) Python succeeds,
+record both: `FLYDSL_PY=/opt/venv/bin/python` for kernel authoring,
+`WORKLOAD_PY=...` for the end-to-end benchmark. **You will need a
+cross-Python integration plan** — see Tier 2 below.
 
-uv can install a standalone CPython of any version without disturbing the
-workload's venv or the system. The image already has uv available (every
-amdpilot image carries `uv`). Detection + install recipe:
+### Step 0b — verify: does kernel COMPILATION + EXECUTION work?
+
+`import flydsl` succeeding is a necessary but not sufficient signal.
+The C++ type registry only fully populates after `flydsl.compile(...)`
+runs, and the `.so` runtime only proves itself when a kernel actually
+executes on the GPU. Smoke-test with the simplest known-good kernel
+shipped by the FlyDSL distribution (`elementwise_add` from
+`flydsl_tests`):
 
 ```bash
+"$FLYDSL_PY" - <<'PY'
+import sys, importlib.util, importlib
+import torch, flydsl
+
+# flydsl_tests is shipped alongside flydsl in pip-installed images and
+# contains the canonical kernel test harness. Its tests `from tests.*`
+# but the package itself is installed as `flydsl_tests`, so alias.
+import flydsl_tests
+sys.modules['tests'] = flydsl_tests
+
+# Locate flydsl_tests.kernels.test_eltwise_add and run a tiny shape.
+import os
+fp = os.path.join(os.path.dirname(flydsl_tests.__file__), 'kernels', 'test_eltwise_add.py')
+spec = importlib.util.spec_from_file_location('_smoke', fp)
+mod  = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+mod.test_compile_and_run(M=129, N=255)  # asserts internally on max-err
+print('FlyDSL kernel compiled + ran on GPU OK')
+PY
+```
+
+Expected output ends with `[FLIR INFO] Verification: Max error: 0.00e+00`
+followed by `FlyDSL kernel compiled + ran on GPU OK`. Anything else is
+a real failure (do not paper over it).
+
+If this runs to completion (max-abs-err small), FlyDSL is functional in
+this Python and you can proceed. If it crashes — read the error
+*before* trying workarounds:
+
+- `nanobind: type 'IntTupleType' ... base type "mlir::python::mlir::PyType" not known to nanobind!`
+  → You're loading the broken raw-build `flydsl` package via a
+  PYTHONPATH that shadows the pip-installed one. `unset PYTHONPATH` and
+  re-try with this Python — do not retry the same path with a different
+  Python interpreter, the path is the bug.
+- `ModuleNotFoundError: No module named 'flydsl.expr'`
+  → You're using an older pip-installed flydsl (v0.0.1.dev) that does
+  not have the `flydsl.expr` API. The kernel files in this version use
+  `build_<name>_module(...)` + `flydsl.compile(...)` instead of
+  `@flyc.kernel`. Use the older API directly; do not search for `flyc`.
+- `cpython-3XX-x86_64-linux-gnu.so: ELF class mismatch / undefined symbol`
+  → Genuine ABI mismatch. Move to "Tier 1: parallel Python via uv" below.
+
+### Once you have a working FLYDSL_PY
+
+- Always launch `"$FLYDSL_PY" -c '...'` *with* `PYTHONPATH` cleared.
+- If your `FLYDSL_PY` differs from `WORKLOAD_PY` (cross-Python case),
+  remember that you cannot just `from flydsl import ...` in
+  `WORKLOAD_PY`. The integration paths are:
+  - **Same Python case** (FLYDSL_PY == WORKLOAD_PY): import flydsl
+    directly in the workload's torch path; this is the easy case.
+  - **Cross-Python case** (FLYDSL_PY != WORKLOAD_PY): use Tier 2 below
+    (kernel artifact handoff via `.hsaco`/`hipModuleLoad`).
+
+### Tier 1 (rare last-resort): install a parallel matching Python via uv
+
+Only fall through to this when:
+
+- `WORKLOAD_PY` cannot import flydsl (ABI mismatch or missing), AND
+- No image-bundled Python (Step 0a B) has flydsl pip-installed, AND
+- `/opt/FlyDSL` exists with `.so` files for a specific cp3XX ABI you
+  could match.
+
+```bash
+unset PYTHONPATH
+
 # Detect FlyDSL's required CPython ABI from its .so files.
 ABI_DIGITS=$(ls /opt/FlyDSL/build-fly/python_packages/flydsl/_mlir/_mlir_libs/*.cpython-*.so \
              2>/dev/null | head -1 | grep -oP 'cpython-\K[0-9]+' | head -1)
-# e.g. "310" -> "3.10", "311" -> "3.11", "312" -> "3.12".
 FLYDSL_PYVER="${ABI_DIGITS:0:1}.${ABI_DIGITS:1}"
-echo "FlyDSL was built for Python $FLYDSL_PYVER"
-
-# Install that Python alongside the workload's venv.
 uv python install "$FLYDSL_PYVER"
 FLYDSL_PY=$(uv python find "$FLYDSL_PYVER")
-echo "Use $FLYDSL_PY for FlyDSL operations"
 
-# Verify (PYTHONPATH inline ONLY for this call).
-PYTHONPATH=/opt/FlyDSL/build-fly/python_packages:/opt/FlyDSL "$FLYDSL_PY" \
-    -c 'import flydsl; print("flydsl OK in parallel Python")'
+# Verify with PYTHONPATH set ONLY for this call.
+PYTHONPATH=/opt/FlyDSL/build-fly/python_packages \
+    "$FLYDSL_PY" -c 'import flydsl; print("flydsl ok in parallel python")'
 ```
 
-**Critical**: keep `PYTHONPATH` scoped to each `$FLYDSL_PY` invocation. Do
-not `export PYTHONPATH=...`, do not add it to `bench_config.env`, and do
-not set it in the task's container env. A globally-set PYTHONPATH leaks
-into `$WORKLOAD_PY` and breaks unrelated imports — the workload's torch
-/ openpi / etc. would try to load FlyDSL `.so` files compiled for a
-different ABI and fail with circular-import or symbol-not-found errors
-that look unrelated.
-
-#### Tier 1 caveat: `import flydsl` may pass but kernel authoring may still crash
-
-Getting `import flydsl` to succeed under the parallel Python is a
-necessary but **not sufficient** condition. uv-managed CPython builds
-ship from `python-build-standalone` and use a specific `libstdc++` /
-`libc++abi` runtime ABI that may differ from the one FlyDSL's
-`.so` files were built against. Symptom: `import flydsl` returns
-without error, but the first `@flyc.kernel` invocation aborts with
-something like:
-
-```
-nanobind: type 'IntTupleType' not known to nanobind
-```
-
-or an analogous unknown-type / type-registration crash from the
-nanobind C++ binding layer. This means the Python module loaded but
-the C++ type registry was incomplete because of a runtime-library
-mismatch.
-
-When this happens, the workload-image's FlyDSL distribution and the
-uv-installed CPython are not compatible at the C++ ABI level, even
-though both are nominally `cp310` (or whatever ABI tag matches). The
-right move at that point is to record the crash signature in
-`optimization_state.json` and proceed to **Tier 2** if you have a
-compelling kernel target, or **Tier 3** otherwise. Do not spend trial
-budget reinstalling `libstdc++` or rebuilding nanobind in-place — both
-are deep image-level concerns that won't fit in a trial.
-
-Once the parallel Python's import + at least one trivial kernel build
-works:
-
-- Use `$FLYDSL_PY` for **kernel authoring**, **isolation benchmarks**, and
-  **kernel pre-compilation**.
-- Use `$WORKLOAD_PY` for the workload's PyTorch path and end-to-end
-  benchmarks.
-- Both Pythons live in the same container, share `/opt/FlyDSL`, and stay
-  isolated from each other.
+**Tier 1 caveat: even when import succeeds, `flydsl.compile(...)` may
+abort with `nanobind: ... IntTupleType ... base type "mlir::python::mlir::PyType"
+not known to nanobind!`** The uv-installed CPython
+(`python-build-standalone`) uses a different `libstdc++` runtime than
+the one FlyDSL's `.so` files were linked against, so MLIR's nanobind
+type registry never finishes populating. When this happens you have
+exhausted Tier 1; move to Tier 2 (cross-Python kernel artifact handoff)
+or Tier 3 (skip FlyDSL).
 
 ### Tier 2 (advanced): cross-Python kernel artifact handoff
 

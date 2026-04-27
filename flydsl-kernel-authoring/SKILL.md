@@ -141,7 +141,36 @@ into `$WORKLOAD_PY` and breaks unrelated imports — the workload's torch
 different ABI and fail with circular-import or symbol-not-found errors
 that look unrelated.
 
-Once this works:
+#### Tier 1 caveat: `import flydsl` may pass but kernel authoring may still crash
+
+Getting `import flydsl` to succeed under the parallel Python is a
+necessary but **not sufficient** condition. uv-managed CPython builds
+ship from `python-build-standalone` and use a specific `libstdc++` /
+`libc++abi` runtime ABI that may differ from the one FlyDSL's
+`.so` files were built against. Symptom: `import flydsl` returns
+without error, but the first `@flyc.kernel` invocation aborts with
+something like:
+
+```
+nanobind: type 'IntTupleType' not known to nanobind
+```
+
+or an analogous unknown-type / type-registration crash from the
+nanobind C++ binding layer. This means the Python module loaded but
+the C++ type registry was incomplete because of a runtime-library
+mismatch.
+
+When this happens, the workload-image's FlyDSL distribution and the
+uv-installed CPython are not compatible at the C++ ABI level, even
+though both are nominally `cp310` (or whatever ABI tag matches). The
+right move at that point is to record the crash signature in
+`optimization_state.json` and proceed to **Tier 2** if you have a
+compelling kernel target, or **Tier 3** otherwise. Do not spend trial
+budget reinstalling `libstdc++` or rebuilding nanobind in-place — both
+are deep image-level concerns that won't fit in a trial.
+
+Once the parallel Python's import + at least one trivial kernel build
+works:
 
 - Use `$FLYDSL_PY` for **kernel authoring**, **isolation benchmarks**, and
   **kernel pre-compilation**.

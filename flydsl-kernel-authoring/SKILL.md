@@ -76,6 +76,104 @@ When the image supports FlyDSL, `FLYDSL_ROOT=/opt/FlyDSL`, `PYTHONPATH` already
 contains the FlyDSL package paths, and `LD_LIBRARY_PATH` contains the MLIR libs.
 Do NOT re-export these yourself in the main shell — they are set image-wide.
 
+## ABI compatibility — your workload's Python must match FlyDSL's `.so` ABI
+
+FlyDSL ships as a set of compiled extensions tagged for a specific CPython
+ABI (e.g. `_mlir.cpython-310-x86_64-linux-gnu.so`). The image's `/opt/FlyDSL`
+directory may exist, but the `.so` files only load if the Python you're
+running matches that ABI tag. Workloads commonly run a venv-managed Python
+(uv, conda, plain venv) that differs from the image's system Python — for
+example, a workload whose `pyproject.toml` requires `python>=3.11` runs in a
+3.11 venv even when the image's `/opt/FlyDSL` was built for 3.10.
+
+**Verify the import in the SAME Python interpreter your benchmark uses.**
+Recipe to detect the ABI mismatch up front:
+
+```bash
+# 1. Find the workload's Python (the one your benchmark uses).
+WORKLOAD_PY=$(find /workspace -maxdepth 4 -path '*/.venv/bin/python' -type f 2>/dev/null | head -1)
+WORKLOAD_PY="${WORKLOAD_PY:-$(which python3)}"
+
+# 2. Try the import.
+"$WORKLOAD_PY" --version
+"$WORKLOAD_PY" -c 'import flydsl; print("flydsl OK at", flydsl.__file__)'
+```
+
+If the import fails with `nanobind`-style aborts, `_PyType_AddSubclass` not
+found, `cpython-3XX` mismatch errors, or `ModuleNotFoundError: flydsl`, the
+ABI is mismatched. **Do not give up on FlyDSL** — work through the
+following tiers in order:
+
+### Tier 1 (preferred): install a parallel matching Python via uv
+
+uv can install a standalone CPython of any version without disturbing the
+workload's venv or the system. The image already has uv available (every
+amdpilot image carries `uv`). Detection + install recipe:
+
+```bash
+# Detect FlyDSL's required CPython ABI from its .so files.
+ABI_DIGITS=$(ls /opt/FlyDSL/build-fly/python_packages/flydsl/_mlir/_mlir_libs/*.cpython-*.so \
+             2>/dev/null | head -1 | grep -oP 'cpython-\K[0-9]+' | head -1)
+# e.g. "310" -> "3.10", "311" -> "3.11", "312" -> "3.12".
+FLYDSL_PYVER="${ABI_DIGITS:0:1}.${ABI_DIGITS:1}"
+echo "FlyDSL was built for Python $FLYDSL_PYVER"
+
+# Install that Python alongside the workload's venv.
+uv python install "$FLYDSL_PYVER"
+FLYDSL_PY=$(uv python find "$FLYDSL_PYVER")
+echo "Use $FLYDSL_PY for FlyDSL operations"
+
+# Verify.
+"$FLYDSL_PY" -c 'import flydsl; print("flydsl OK in parallel Python")'
+```
+
+Once this works:
+
+- Use `$FLYDSL_PY` for **kernel authoring**, **isolation benchmarks**, and
+  **kernel pre-compilation**.
+- Use `$WORKLOAD_PY` for the workload's PyTorch path and end-to-end
+  benchmarks.
+- Both Pythons live in the same container, share `/opt/FlyDSL`, and stay
+  isolated from each other.
+
+### Tier 2 (advanced): cross-Python kernel artifact handoff
+
+When your kernel wins under `$FLYDSL_PY` in isolation, integrate it into the
+workload's `$WORKLOAD_PY` torch path WITHOUT importing FlyDSL there:
+
+1. Compile the FlyDSL kernel for the target shape using `$FLYDSL_PY`.
+   Dump the final ROCDL ASM via `FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=./dumps`
+   (already documented in the gotchas). The dump produces a `final_isa.s`
+   plus per-pass MLIR.
+2. Convert the ASM to a `.hsaco` (HSA Code Object) using `clang-offload-bundler`
+   or `llvm-mc` from ROCm's toolchain. The `.hsaco` is the runtime artifact
+   that `hipModuleLoad` consumes.
+3. From `$WORKLOAD_PY`, write a small `torch.utils.cpp_extension.load_inline`
+   wrapper that does `hipModuleLoad` on the `.hsaco`, looks up the kernel
+   symbol, and exposes a `(torch.Tensor, ...) -> torch.Tensor` callable.
+   The kernel call path is then pure C++/HIP at runtime — no Python-version
+   compatibility issue.
+
+This is advanced. Only attempt after the isolation bench under `$FLYDSL_PY`
+already shows a meaningful win for your target shape. If your kernel works
+in isolation but the cross-Python integration is too heavy for the trial
+budget, document the isolation result in `optimization_state.json` and
+fall through to Tier 3.
+
+### Tier 3 (last resort): document and pivot to non-FlyDSL kernel work
+
+After Tiers 1 and 2 fail (e.g. uv install offline-blocked, ABI tag too
+exotic, no compatible CPython available), document the mismatch in
+`optimization_state.json` and pivot to **non-FlyDSL** kernel-fusion work
+in this stage: kernel fusion via `torch.compile`, attention backend
+selection, Inductor config tuning, hipBLASLt autotune, custom Triton
+kernels — these don't depend on the FlyDSL Python frontend and often
+produce comparable wins on memory-bound or fusion-bound hotspots.
+
+Do **not** spend the trial fighting the FlyDSL build itself: the
+`/opt/FlyDSL` distribution is per-image, and rebuilding from source
+(MLIR + nanobind + ROCm) is hours of work that won't fit in a trial.
+
 ## Existing kernels are HEADSTART code — inventory `/opt/FlyDSL/kernels/` FIRST
 
 Before authoring any new kernel, list `/opt/FlyDSL/kernels/`. The directory

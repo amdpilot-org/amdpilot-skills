@@ -94,9 +94,14 @@ Recipe to detect the ABI mismatch up front:
 WORKLOAD_PY=$(find /workspace -maxdepth 4 -path '*/.venv/bin/python' -type f 2>/dev/null | head -1)
 WORKLOAD_PY="${WORKLOAD_PY:-$(which python3)}"
 
-# 2. Try the import.
+# 2. Try the import. Note: PYTHONPATH must be set inline ONLY for this
+# call — do NOT export it to the shell, and do NOT add it to
+# bench_config.env. The workload's PyTorch / openpi / etc. imports
+# will break if a `/opt/FlyDSL/build-fly/python_packages` entry leaks
+# into a Python whose ABI doesn't match the FlyDSL .so files.
 "$WORKLOAD_PY" --version
-"$WORKLOAD_PY" -c 'import flydsl; print("flydsl OK at", flydsl.__file__)'
+PYTHONPATH=/opt/FlyDSL/build-fly/python_packages:/opt/FlyDSL "$WORKLOAD_PY" \
+    -c 'import flydsl; print("flydsl OK at", flydsl.__file__)'
 ```
 
 If the import fails with `nanobind`-style aborts, `_PyType_AddSubclass` not
@@ -123,9 +128,18 @@ uv python install "$FLYDSL_PYVER"
 FLYDSL_PY=$(uv python find "$FLYDSL_PYVER")
 echo "Use $FLYDSL_PY for FlyDSL operations"
 
-# Verify.
-"$FLYDSL_PY" -c 'import flydsl; print("flydsl OK in parallel Python")'
+# Verify (PYTHONPATH inline ONLY for this call).
+PYTHONPATH=/opt/FlyDSL/build-fly/python_packages:/opt/FlyDSL "$FLYDSL_PY" \
+    -c 'import flydsl; print("flydsl OK in parallel Python")'
 ```
+
+**Critical**: keep `PYTHONPATH` scoped to each `$FLYDSL_PY` invocation. Do
+not `export PYTHONPATH=...`, do not add it to `bench_config.env`, and do
+not set it in the task's container env. A globally-set PYTHONPATH leaks
+into `$WORKLOAD_PY` and breaks unrelated imports — the workload's torch
+/ openpi / etc. would try to load FlyDSL `.so` files compiled for a
+different ABI and fail with circular-import or symbol-not-found errors
+that look unrelated.
 
 Once this works:
 

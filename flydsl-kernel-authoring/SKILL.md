@@ -167,9 +167,61 @@ Expected output ends with `[FLIR INFO] Verification: Max error: 0.00e+00`
 followed by `FlyDSL kernel compiled + ran on GPU OK`. Anything else is
 a real failure (do not paper over it).
 
-If this runs to completion (max-abs-err small), FlyDSL is functional in
-this Python and you can proceed. If it crashes — read the error
-*before* trying workarounds:
+### Step 0c — workload-shape isolation correctness check (mandatory)
+
+Step 0b proves the toolchain works on a tiny shape; Step 0c proves it
+works at the shapes your real workload uses. **Do this before any
+profiling or source reading.** Use one of the kernels empirically
+verified to build cleanly under pip-flydsl 0.0.1.dev (most images
+ship this pinned version):
+
+| kernel | dtype | M, N | status (validated 2026-04-28) |
+| --- | --- | --- | --- |
+| `flydsl.kernels.softmax_kernel` | bf16, f16, f32 | any (M, N), N is the reduction axis | works for arbitrary N, fast path for N % BLOCK_THREADS*VEC_WIDTH == 0 |
+| `flydsl_tests.kernels.test_eltwise_add` | f32 | any (M, N) | works for arbitrary shape |
+| `flydsl.kernels.rmsnorm_kernel` | — | — | **broken on pip-flydsl 0.0.1.dev**: ValueError at build time on bf16 / non-power-of-2 N. Skip on this version. |
+| `flydsl.kernels.layernorm_kernel` | — | — | **broken on pip-flydsl 0.0.1.dev**: ValueError on memref.store at build time. Skip on this version. |
+
+Recipe (substitute your workload's real M, N, dtype):
+
+```bash
+"$FLYDSL_PY" - <<'PY'
+import torch, flydsl, torch.nn.functional as F
+from flydsl.kernels.softmax_kernel import build_softmax_module
+
+M, N, dtype_str = 256, 2048, 'bf16'   # <- replace with your shape
+torch_dtype = {'f16': torch.float16, 'bf16': torch.bfloat16, 'f32': torch.float32}[dtype_str]
+
+mod = build_softmax_module(M, N, dtype_str)
+exe = flydsl.compile(mod)
+
+x   = torch.randn(M, N, dtype=torch_dtype, device='cuda').contiguous()
+out = torch.empty_like(x)
+exe(x, out, M)
+torch.cuda.synchronize()
+
+ref = F.softmax(x.float(), dim=-1).to(torch_dtype)
+err = (out - ref).abs().max().item()
+print(f'softmax M={M} N={N} {dtype_str}: max_err={err:.4e}',
+      'PASS' if err < 1e-2 else 'FAIL')
+PY
+```
+
+Expected `max_err < 1e-5` for bf16, `< 1e-4` for f16. If the chosen
+kernel hits a `ValueError` / `TypeError` at compile time (the table
+above lists known-bad ones for pip-flydsl 0.0.1.dev), record the
+exact error in `optimization_state.json`, then **do not debug
+upstream pip-flydsl internals** — pick the next kernel from the
+"works" rows of the table and try again. Do NOT waste trial time
+trying to fix `rmsnorm_kernel.py` or `layernorm_kernel.py` by hand;
+those are upstream bugs.
+
+A passing Step 0c IS a valid FlyDSL trial attempt by itself — it
+demonstrates the toolchain works on workload shapes, which is the
+foundation for any later integration work. Counts as one of the two
+required attempts under the cross-Python case.
+
+### If Step 0b crashes — read the error *before* trying workarounds:
 
 - `nanobind: type 'IntTupleType' ... base type "mlir::python::mlir::PyType" not known to nanobind!`
   → You're loading the broken raw-build `flydsl` package via a

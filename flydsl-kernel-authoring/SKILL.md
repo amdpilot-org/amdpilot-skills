@@ -106,7 +106,9 @@ to find the right Python and DROP the bad PYTHONPATH.
 unset PYTHONPATH
 
 # A. Check the workload's Python (the one your benchmark already uses).
-WORKLOAD_PY=$(find /workspace -maxdepth 5 -path '*/.venv/bin/python' -type f 2>/dev/null | head -1)
+#    Use `-L` so symlinks (most managed venvs are symlinks) are followed.
+WORKLOAD_PY=$(find -L /workspace -maxdepth 5 -path '*/.venv/bin/python' \
+              -executable 2>/dev/null | head -1)
 WORKLOAD_PY="${WORKLOAD_PY:-$(which python3)}"
 "$WORKLOAD_PY" -c 'import flydsl, sys; print("WORKLOAD_PY OK:", flydsl.__file__, sys.version_info[:2])' 2>&1 | head -3
 

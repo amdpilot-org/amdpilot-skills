@@ -1,0 +1,7 @@
+interface:
+  display_name: "AMDPilot Issue Probe"
+  short_description: "Probe and debug AMDPilot issue launches"
+  default_prompt: "Use $amdpilot-issue-workflow to run one AMDPilot GitHub issue as an end-to-end probe, classify the first wrong boundary, and route the durable fix or follow-up."
+
+policy:
+  allow_implicit_invocation: true

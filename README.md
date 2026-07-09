@@ -9,6 +9,7 @@ Agent skills collection for AMD hardware development workflows.
 - **rocm-profiler-analysis**: Turn SGLang/vLLM profiling runs into ROCm-aware triage artifacts (kernel, overlap, fuse) that can be attached to experiments and shown in dashboard
 - **clean-code-style**: Behavioral guidelines to reduce common LLM coding mistakes — think before coding, simplicity first, surgical changes, goal-driven execution
 - **skill-creator**: Guide for creating effective skills. Imported from https://github.com/anthropics/skills
+- **amdpilot-issue-workflow**: Use one GitHub issue as a controlled AMDPilot end-to-end probe; diagnose dashboard/formulation/Docker/baseline/node/scheduler/serving/agent failures and route durable fixes.
 
 ## Usage as Git Submodule
 
